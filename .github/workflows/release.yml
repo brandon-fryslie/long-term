@@ -31,10 +31,6 @@ jobs:
           GOOS=darwin GOARCH=amd64 go build -o long-term-darwin-amd64 .
           GOOS=darwin GOARCH=arm64 go build -o long-term-darwin-arm64 .
 
-          # Windows
-          GOOS=windows GOARCH=amd64 go build -o long-term-windows-amd64.exe .
-          GOOS=windows GOARCH=arm64 go build -o long-term-windows-arm64.exe .
-
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -43,6 +39,4 @@ jobs:
             long-term-linux-arm64
             long-term-darwin-amd64
             long-term-darwin-arm64
-            long-term-windows-amd64.exe
-            long-term-windows-arm64.exe
           generate_release_notes: true
