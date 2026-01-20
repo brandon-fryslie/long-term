@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -8,7 +9,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"golang.org/x/term"
@@ -70,6 +73,52 @@ func main() {
 	}
 }
 
+// magicDetector observes stdin for Ctrl+\ pressed 3 times within 500ms
+type magicDetector struct {
+	toggleChan  chan bool
+	lastPress   time.Time
+	pressCount  int
+	magicByte   byte
+	window      time.Duration
+	targetCount int
+}
+
+func newMagicDetector(toggleChan chan bool) *magicDetector {
+	return &magicDetector{
+		toggleChan:  toggleChan,
+		magicByte:   0x1C, // Ctrl+\ (SIGQUIT character)
+		window:      500 * time.Millisecond,
+		targetCount: 3,
+	}
+}
+
+func (m *magicDetector) Write(p []byte) (n int, err error) {
+	now := time.Now()
+
+	// Check if we need to reset the counter (window expired)
+	if !m.lastPress.IsZero() && now.Sub(m.lastPress) > m.window {
+		m.pressCount = 0
+	}
+
+	// Count occurrences of magic byte in this chunk
+	count := bytes.Count(p, []byte{m.magicByte})
+	if count > 0 {
+		m.pressCount += count
+		m.lastPress = now
+
+		if m.pressCount >= m.targetCount {
+			// Trigger toggle
+			select {
+			case m.toggleChan <- true:
+			default:
+			}
+			m.pressCount = 0 // Reset after triggering
+		}
+	}
+
+	return len(p), nil
+}
+
 func run(args []string, fakeHeight, heightDelta int) error {
 	// Get the real terminal size
 	realWidth, realHeight, err := term.GetSize(int(os.Stdin.Fd()))
@@ -87,6 +136,24 @@ func run(args []string, fakeHeight, heightDelta int) error {
 			effectiveHeight = 1
 		}
 	}
+
+	// Toggle mode: false = use fake/delta height, true = use real height
+	var useRealSize atomic.Bool
+	useRealSize.Store(false)
+
+	// Create SIGWINCH channel first (needed by toggle handler)
+	sigwinch := make(chan os.Signal, 1)
+
+	// Channel for toggle events
+	toggleChan := make(chan bool, 1)
+	go func() {
+		for range toggleChan {
+			current := useRealSize.Load()
+			useRealSize.Store(!current)
+			// Trigger a window resize to apply the change
+			sigwinch <- syscall.SIGWINCH
+		}
+	}()
 
 	// Create the command, using shell if needed for aliases
 	var cmd *exec.Cmd
@@ -113,21 +180,27 @@ func run(args []string, fakeHeight, heightDelta int) error {
 	defer ptmx.Close()
 
 	// Handle SIGWINCH (window resize)
-	sigwinch := make(chan os.Signal, 1)
 	signal.Notify(sigwinch, syscall.SIGWINCH)
 	go func() {
 		for range sigwinch {
 			if w, h, err := term.GetSize(int(os.Stdin.Fd())); err == nil {
-				// Recalculate effective height on resize
-				h := h
-				if heightDelta != 0 {
-					h = h + heightDelta
-					if h < 1 {
-						h = 1
+				// Determine which height to use based on toggle state
+				targetHeight := h
+				if !useRealSize.Load() {
+					// Use fake/delta height
+					if heightDelta != 0 {
+						targetHeight = h + heightDelta
+						if targetHeight < 1 {
+							targetHeight = 1
+						}
+					} else {
+						targetHeight = fakeHeight
 					}
 				}
+				// else: use real height (targetHeight already = h)
+
 				pty.Setsize(ptmx, &pty.Winsize{
-					Rows: uint16(h),
+					Rows: uint16(targetHeight),
 					Cols: uint16(w),
 				})
 			}
@@ -147,9 +220,11 @@ func run(args []string, fakeHeight, heightDelta int) error {
 	}
 
 	// Proxy I/O
-	// stdin -> pty
+	// stdin -> pty (with magic key detection)
 	go func() {
-		io.Copy(ptmx, os.Stdin)
+		detector := newMagicDetector(toggleChan)
+		tee := io.TeeReader(os.Stdin, detector)
+		io.Copy(ptmx, tee)
 	}()
 	// pty -> stdout
 	go func() {
