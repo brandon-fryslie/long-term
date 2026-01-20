@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -16,6 +17,207 @@ import (
 	"github.com/creack/pty"
 	"golang.org/x/term"
 )
+
+// Mode represents the current operating mode
+type Mode uint32
+
+const (
+	ModeNormal  Mode = 0 // Normal I/O passthrough
+	ModeCommand Mode = 1 // Command mode (UI active, intercept input)
+)
+
+// KeyCode represents parsed keyboard input
+type KeyCode int
+
+const (
+	KeyUnknown KeyCode = iota
+	KeyChar             // Regular character (a-z, 0-9, space, etc)
+	KeyESC
+	KeyUp
+	KeyDown
+	KeyLeft
+	KeyRight
+	KeyBackspace
+	KeyEnter
+)
+
+// KeyEvent represents a parsed keyboard event
+type KeyEvent struct {
+	Code      KeyCode
+	Char      rune   // Valid when Code == KeyChar
+	Shift     bool   // Modifier flags
+	Ctrl      bool
+	ShiftCtrl bool
+}
+
+// NumericMode tracks numeric input state
+type NumericMode int
+
+const (
+	NumericNone   NumericMode = iota
+	NumericHeight             // 'n' pressed - entering absolute height
+	NumericDelta              // 'd' pressed - entering delta
+)
+
+// NumericBuffer accumulates numeric input
+type NumericBuffer struct {
+	mode   NumericMode
+	digits []rune
+}
+
+func (nb *NumericBuffer) reset() {
+	nb.mode = NumericNone
+	nb.digits = nil
+}
+
+func (nb *NumericBuffer) append(r rune) {
+	nb.digits = append(nb.digits, r)
+}
+
+func (nb *NumericBuffer) backspace() {
+	if len(nb.digits) > 0 {
+		nb.digits = nb.digits[:len(nb.digits)-1]
+	}
+}
+
+func (nb *NumericBuffer) value() (int, error) {
+	if len(nb.digits) == 0 {
+		return 0, fmt.Errorf("empty input")
+	}
+	s := string(nb.digits)
+	val, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+
+	// Validate range
+	if nb.mode == NumericHeight {
+		if val < 1 || val > 9999 {
+			return 0, fmt.Errorf("height must be 1-9999")
+		}
+	} else if nb.mode == NumericDelta {
+		// Delta requires +/- prefix
+		if len(s) == 0 || (s[0] != '+' && s[0] != '-') {
+			return 0, fmt.Errorf("delta requires +/- prefix")
+		}
+		if val < -9999 || val > 9999 {
+			return 0, fmt.Errorf("delta must be ±1 to ±9999")
+		}
+	}
+	return val, nil
+}
+
+// keyboardParser reads stdin and emits KeyEvent structs
+type keyboardParser struct {
+	eventChan  chan KeyEvent
+	buf        []byte
+	state      int // 0=idle, 1=saw ESC, 2=saw ESC[
+	lastESC    time.Time
+	escTimeout time.Duration
+}
+
+func newKeyboardParser() *keyboardParser {
+	return &keyboardParser{
+		eventChan:  make(chan KeyEvent, 10),
+		buf:        make([]byte, 0, 16),
+		escTimeout: 100 * time.Millisecond,
+	}
+}
+
+// Write implements io.Writer to observe stdin bytes
+func (kp *keyboardParser) Write(p []byte) (n int, err error) {
+	for _, b := range p {
+		kp.processByte(b)
+	}
+	return len(p), nil
+}
+
+func (kp *keyboardParser) processByte(b byte) {
+	now := time.Now()
+
+	// Check for ESC timeout
+	if kp.state > 0 && !kp.lastESC.IsZero() && now.Sub(kp.lastESC) > kp.escTimeout {
+		// Timeout - emit standalone ESC
+		kp.eventChan <- KeyEvent{Code: KeyESC}
+		kp.state = 0
+		kp.buf = kp.buf[:0]
+	}
+
+	switch kp.state {
+	case 0: // Idle
+		if b == 0x1B { // ESC
+			kp.state = 1
+			kp.lastESC = now
+		} else if b == 0x7F { // Backspace
+			kp.eventChan <- KeyEvent{Code: KeyBackspace}
+		} else if b == '\r' || b == '\n' {
+			kp.eventChan <- KeyEvent{Code: KeyEnter}
+		} else if b >= 0x20 && b < 0x7F { // Printable ASCII
+			kp.eventChan <- KeyEvent{Code: KeyChar, Char: rune(b)}
+		}
+		// Ignore other control characters
+
+	case 1: // Saw ESC
+		if b == '[' {
+			kp.state = 2
+			kp.buf = kp.buf[:0]
+		} else {
+			// Not a sequence, emit ESC and process this byte
+			kp.eventChan <- KeyEvent{Code: KeyESC}
+			kp.state = 0
+			kp.processByte(b) // Reprocess current byte
+		}
+
+	case 2: // Saw ESC[
+		kp.buf = append(kp.buf, b)
+		// Check for complete sequences
+		if b >= 0x40 && b <= 0x7E { // Final byte of sequence
+			kp.parseSequence()
+			kp.state = 0
+			kp.buf = kp.buf[:0]
+		}
+	}
+}
+
+func (kp *keyboardParser) parseSequence() {
+	seq := string(kp.buf)
+
+	// Parse arrow keys with modifiers
+	// Basic arrows: A=up, B=down, C=right, D=left
+	// Modified: ESC[1;XY where X=modifier, Y=direction
+	// Modifiers: 2=Shift, 5=Ctrl, 6=Shift+Ctrl
+
+	var event KeyEvent
+
+	switch seq {
+	case "A":
+		event.Code = KeyUp
+	case "B":
+		event.Code = KeyDown
+	case "C":
+		event.Code = KeyRight
+	case "D":
+		event.Code = KeyLeft
+	case "1;2A":
+		event = KeyEvent{Code: KeyUp, Shift: true}
+	case "1;2B":
+		event = KeyEvent{Code: KeyDown, Shift: true}
+	case "1;5A":
+		event = KeyEvent{Code: KeyUp, Ctrl: true}
+	case "1;5B":
+		event = KeyEvent{Code: KeyDown, Ctrl: true}
+	case "1;6A":
+		event = KeyEvent{Code: KeyUp, ShiftCtrl: true}
+	case "1;6B":
+		event = KeyEvent{Code: KeyDown, ShiftCtrl: true}
+	default:
+		event.Code = KeyUnknown
+	}
+
+	if event.Code != KeyUnknown {
+		kp.eventChan <- event
+	}
+}
 
 func main() {
 	height := flag.Int("height", 10000, "fake terminal height to report to the wrapped program")
@@ -119,7 +321,7 @@ func (m *magicDetector) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-func run(args []string, fakeHeight, heightDelta int) error {
+func run(args []string, initialHeight, initialDelta int) error {
 	// Get the real terminal size
 	realWidth, realHeight, err := term.GetSize(int(os.Stdin.Fd()))
 	if err != nil {
@@ -128,30 +330,153 @@ func run(args []string, fakeHeight, heightDelta int) error {
 		realHeight = 24
 	}
 
+	// Height and delta: single source of truth (atomic for lock-free access)
+	var currentHeight atomic.Int32
+	var currentDelta atomic.Int32
+	currentHeight.Store(int32(initialHeight))
+	currentDelta.Store(int32(initialDelta))
+
 	// Calculate effective height
-	effectiveHeight := fakeHeight
-	if heightDelta != 0 {
-		effectiveHeight = realHeight + heightDelta
+	effectiveHeight := initialHeight
+	if initialDelta != 0 {
+		effectiveHeight = realHeight + initialDelta
 		if effectiveHeight < 1 {
 			effectiveHeight = 1
 		}
 	}
 
+	// Mode state: single source of truth
+	var currentMode atomic.Uint32
+	currentMode.Store(uint32(ModeNormal))
+
 	// Toggle mode: false = use fake/delta height, true = use real height
 	var useRealSize atomic.Bool
 	useRealSize.Store(false)
 
+	// Numeric input state
+	var numericBuf NumericBuffer
+
+	// Create keyboard parser
+	kbParser := newKeyboardParser()
+
 	// Create SIGWINCH channel first (needed by toggle handler)
 	sigwinch := make(chan os.Signal, 1)
 
-	// Channel for toggle events
-	toggleChan := make(chan bool, 1)
+	// Channel for entering command mode (Ctrl+\ x3)
+	enterCommandChan := make(chan bool, 1)
 	go func() {
-		for range toggleChan {
-			current := useRealSize.Load()
-			useRealSize.Store(!current)
-			// Trigger a window resize to apply the change
-			sigwinch <- syscall.SIGWINCH
+		for range enterCommandChan {
+			currentMode.Store(uint32(ModeCommand))
+			// TODO: Show UI in Sprint 2
+		}
+	}()
+
+	// Command handler goroutine - processes keyboard events in command mode
+	go func() {
+		for event := range kbParser.eventChan {
+			if Mode(currentMode.Load()) != ModeCommand {
+				continue
+			}
+
+			// Handle numeric input mode
+			if numericBuf.mode != NumericNone {
+				switch event.Code {
+				case KeyESC:
+					numericBuf.reset()
+					// TODO: Update UI
+				case KeyBackspace:
+					numericBuf.backspace()
+					// TODO: Update UI
+				case KeyEnter:
+					val, err := numericBuf.value()
+					if err == nil {
+						// Apply value
+						if numericBuf.mode == NumericHeight {
+							currentHeight.Store(int32(val))
+							currentDelta.Store(0) // Clear delta when setting absolute
+						} else if numericBuf.mode == NumericDelta {
+							currentDelta.Store(int32(val))
+						}
+						numericBuf.reset()
+						// Trigger resize
+						sigwinch <- syscall.SIGWINCH
+					}
+					// TODO: Show error if invalid
+				case KeyChar:
+					if event.Char >= '0' && event.Char <= '9' {
+						numericBuf.append(event.Char)
+					} else if numericBuf.mode == NumericDelta && len(numericBuf.digits) == 0 {
+						if event.Char == '+' || event.Char == '-' {
+							numericBuf.append(event.Char)
+						}
+					}
+					// TODO: Update UI
+				}
+				continue
+			}
+
+			// Normal command mode handling
+			switch event.Code {
+			case KeyESC:
+				// Exit command mode
+				currentMode.Store(uint32(ModeNormal))
+				numericBuf.reset()
+				// TODO: Clear UI in Sprint 2
+
+			case KeyChar:
+				switch event.Char {
+				case 'n':
+					numericBuf.mode = NumericHeight
+					numericBuf.digits = nil
+					// TODO: Update UI to show prompt
+				case 'd':
+					numericBuf.mode = NumericDelta
+					numericBuf.digits = nil
+					// TODO: Update UI to show prompt
+				case ' ':
+					// Toggle real/fake size
+					current := useRealSize.Load()
+					useRealSize.Store(!current)
+					sigwinch <- syscall.SIGWINCH
+					// TODO: Update UI
+				case 'r':
+					// Reset to defaults from flags
+					currentHeight.Store(int32(initialHeight))
+					currentDelta.Store(int32(initialDelta))
+					useRealSize.Store(false)
+					sigwinch <- syscall.SIGWINCH
+					// TODO: Update UI
+				}
+
+			case KeyUp, KeyDown:
+				// Adjust height based on modifiers
+				delta := 1
+				if event.Shift {
+					delta = 20
+				} else if event.Ctrl {
+					delta = 200
+				} else if event.ShiftCtrl {
+					delta = 200
+				}
+				if event.Code == KeyDown {
+					delta = -delta
+				}
+
+				// Apply delta
+				if currentDelta.Load() != 0 {
+					currentDelta.Add(int32(delta))
+				} else {
+					newHeight := int(currentHeight.Load()) + delta
+					if newHeight < 1 {
+						newHeight = 1
+					} else if newHeight > 9999 {
+						newHeight = 9999
+					}
+					currentHeight.Store(int32(newHeight))
+				}
+				sigwinch <- syscall.SIGWINCH
+				// TODO: Update UI
+			}
 		}
 	}()
 
@@ -188,13 +513,14 @@ func run(args []string, fakeHeight, heightDelta int) error {
 				targetHeight := h
 				if !useRealSize.Load() {
 					// Use fake/delta height
-					if heightDelta != 0 {
-						targetHeight = h + heightDelta
+					delta := int(currentDelta.Load())
+					if delta != 0 {
+						targetHeight = h + delta
 						if targetHeight < 1 {
 							targetHeight = 1
 						}
 					} else {
-						targetHeight = fakeHeight
+						targetHeight = int(currentHeight.Load())
 					}
 				}
 				// else: use real height (targetHeight already = h)
@@ -220,11 +546,27 @@ func run(args []string, fakeHeight, heightDelta int) error {
 	}
 
 	// Proxy I/O
-	// stdin -> pty (with magic key detection)
+	// stdin -> pty (with magic key detection and keyboard parsing)
 	go func() {
-		detector := newMagicDetector(toggleChan)
-		tee := io.TeeReader(os.Stdin, detector)
-		io.Copy(ptmx, tee)
+		magicDet := newMagicDetector(enterCommandChan)
+		// Chain: stdin -> magicDetector -> keyboardParser -> pty (if normal mode)
+		multiWriter := io.MultiWriter(magicDet, kbParser)
+		tee := io.TeeReader(os.Stdin, multiWriter)
+
+		// Copy to PTY, but check mode first
+		buf := make([]byte, 1024)
+		for {
+			n, err := tee.Read(buf)
+			if err != nil {
+				break
+			}
+
+			// Only forward to PTY if in normal mode
+			if Mode(currentMode.Load()) == ModeNormal {
+				ptmx.Write(buf[:n])
+			}
+			// In command mode, input is intercepted by keyboard parser
+		}
 	}()
 	// pty -> stdout
 	go func() {
