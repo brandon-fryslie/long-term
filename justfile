@@ -3,6 +3,7 @@ build:
 
 install: build
     mkdir -p ~/.local/bin
+    long-term bash -c "echo true" | grep -q true && rm -f ~/.local/bin/long-term
     cp long-term ~/.local/bin/
 
 release TYPE:

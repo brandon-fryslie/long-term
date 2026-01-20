@@ -1,6 +1,6 @@
-# giant-pty
+# long-term
 
-A long-term PTY wrapper that allows you to run commands with a fake terminal height, useful for testing and scripts that need specific terminal dimensions.
+Make your terminal really looooooooong.  Why?  
 
 ## Features
 
@@ -16,23 +16,23 @@ A long-term PTY wrapper that allows you to run commands with a fake terminal hei
 ### Quick Install
 
 ```bash
-curl -fsSL https://github.com/bmf/giant-pty/releases/latest/download/$(uname -s | tr A-Z a-z)-$(uname -m) -o ~/.local/bin/long-term && chmod +x ~/.local/bin/long-term
+curl -fsSL https://github.com/bmf/long-term/releases/latest/download/$(uname -s | tr A-Z a-z)-$(uname -m) -o ~/.local/bin/long-term && chmod +x ~/.local/bin/long-term
 ```
 
 ### From GitHub Releases
 
-Download the latest binary for your platform from the [releases page](https://github.com/bmf/giant-pty/releases):
+Download the latest binary for your platform from the [releases page](https://github.com/bmf/long-term/releases):
 
 #### macOS
 
 ```bash
 # For Apple Silicon (M1/M2/etc)
-curl -L https://github.com/bmf/giant-pty/releases/download/v0.1.0/long-term-darwin-arm64 -o long-term
+curl -L https://github.com/bmf/long-term/releases/download/v0.1.0/long-term-darwin-arm64 -o long-term
 chmod +x long-term
 sudo mv long-term /usr/local/bin/
 
 # For Intel Macs
-curl -L https://github.com/bmf/giant-pty/releases/download/v0.1.0/long-term-darwin-amd64 -o long-term
+curl -L https://github.com/bmf/long-term/releases/download/v0.1.0/long-term-darwin-amd64 -o long-term
 chmod +x long-term
 sudo mv long-term /usr/local/bin/
 ```
@@ -41,12 +41,12 @@ sudo mv long-term /usr/local/bin/
 
 ```bash
 # For x86_64
-curl -L https://github.com/bmf/giant-pty/releases/download/v0.1.0/long-term-linux-amd64 -o long-term
+curl -L https://github.com/bmf/long-term/releases/download/v0.1.0/long-term-linux-amd64 -o long-term
 chmod +x long-term
 sudo mv long-term /usr/local/bin/
 
 # For ARM64
-curl -L https://github.com/bmf/giant-pty/releases/download/v0.1.0/long-term-linux-arm64 -o long-term
+curl -L https://github.com/bmf/long-term/releases/download/v0.1.0/long-term-linux-arm64 -o long-term
 chmod +x long-term
 sudo mv long-term /usr/local/bin/
 ```
@@ -54,8 +54,8 @@ sudo mv long-term /usr/local/bin/
 ### From Source
 
 ```bash
-git clone https://github.com/bmf/giant-pty.git
-cd giant-pty
+git clone https://github.com/bmf/long-term.git
+cd long-term
 go build -o long-term .
 sudo mv long-term /usr/local/bin/
 ```
@@ -69,7 +69,7 @@ just install  # Builds and installs to ~/.local/bin/
 ## Usage
 
 ```
-giant-pty [flags] -- command [args...]
+long-term [flags] -- command [args...]
 ```
 
 ### Flags
@@ -132,7 +132,7 @@ Press **Ctrl+\\** three times (within 500ms) to enter interactive command mode. 
 
 ## How It Works
 
-`giant-pty` creates a pseudo-terminal (PTY) wrapper around your command with a configurable reported height. This is useful for:
+`long-term` creates a pseudo-terminal (PTY) wrapper around your command with a configurable reported height. This is useful for:
 
 - Testing terminal applications with specific height constraints
 - Running interactive programs that check terminal dimensions

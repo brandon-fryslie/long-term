@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -31,7 +32,7 @@ type KeyCode int
 
 const (
 	KeyUnknown KeyCode = iota
-	KeyChar             // Regular character (a-z, 0-9, space, etc)
+	KeyChar            // Regular character (a-z, 0-9, space, etc)
 	KeyESC
 	KeyUp
 	KeyDown
@@ -44,8 +45,8 @@ const (
 // KeyEvent represents a parsed keyboard event
 type KeyEvent struct {
 	Code      KeyCode
-	Char      rune   // Valid when Code == KeyChar
-	Shift     bool   // Modifier flags
+	Char      rune // Valid when Code == KeyChar
+	Shift     bool // Modifier flags
 	Ctrl      bool
 	ShiftCtrl bool
 }
@@ -122,6 +123,36 @@ func ansiMoveCursor(row, col int) string {
 	return fmt.Sprintf("\033[%d;%dH", row, col)
 }
 
+// getMemoryUsage returns memory in MB for the current process
+func getMemoryUsage() float64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return float64(m.Alloc) / 1024 / 1024
+}
+
+// getProcessMemory returns memory in MB for a given PID by reading /proc
+func getProcessMemory(pid int) (float64, error) {
+	statusFile := fmt.Sprintf("/proc/%d/status", pid)
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		return 0, err
+	}
+
+	// Look for VmRSS (resident set size) in KB
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "VmRSS:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				var kb int
+				fmt.Sscanf(fields[1], "%d", &kb)
+				return float64(kb) / 1024, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("VmRSS not found")
+}
+
 // uiRenderer manages /dev/tty output for command mode UI
 type uiRenderer struct {
 	tty       *os.File
@@ -164,9 +195,9 @@ func (ui *uiRenderer) renderBox(termWidth, termHeight, currentHeight, currentDel
 	// Build UI content in buffer
 	var buf bytes.Buffer
 
-	// Hide cursor and save position
-	buf.WriteString(ansiHideCursor)
+	// Save cursor position first, then hide
 	buf.WriteString(ansiSaveCursor)
+	buf.WriteString(ansiHideCursor)
 
 	// Determine mode string
 	modeStr := ""
@@ -187,7 +218,7 @@ func (ui *uiRenderer) renderBox(termWidth, termHeight, currentHeight, currentDel
 		"┌──────────────────────────────────────┐",
 		"│   LONG-TERM ENABLED                  │",
 		"├──────────────────────────────────────┤",
-		fmt.Sprintf("│ Term size: %dx%d %-18s│", termWidth, termHeight, modeStr),
+		fmt.Sprintf("│ Term size: %dx%d %-18s │", termWidth, termHeight, modeStr),
 		"│                                      │",
 	}
 
@@ -240,8 +271,8 @@ func (ui *uiRenderer) clearBox(termWidth, termHeight int) {
 	}
 
 	var buf bytes.Buffer
-	buf.WriteString(ansiHideCursor)
 	buf.WriteString(ansiSaveCursor)
+	buf.WriteString(ansiHideCursor)
 
 	// Clear approximately 10 lines where box was
 	for i := 0; i < 10; i++ {
@@ -369,8 +400,8 @@ func (kp *keyboardParser) parseSequence() {
 }
 
 func main() {
-	height := flag.Int("height", 10000, "fake terminal height to report to the wrapped program")
-	heightDelta := flag.Int("delta", 2000, "report real_height + delta (positive adds rows, negative subtracts; overrides -height if set)")
+	height := flag.Int("height", 10000, "fake terminal height to report to the wrapped program (if set, disables delta mode)")
+	heightDelta := flag.Int("delta", 2000, "report real_height + delta (positive adds rows, negative subtracts; optional + sign for positive values)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] -- command [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Wraps a command with a PTY that reports a fake terminal height.\n")
@@ -386,37 +417,37 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Validate delta usage - must be explicitly positive or negative
-	if *heightDelta != 0 {
-		// Check if user passed the flag
-		deltaSet := false
-		flag.Visit(func(f *flag.Flag) {
-			if f.Name == "delta" {
-				deltaSet = true
-			}
-		})
-		if deltaSet {
-			// User set delta, but we can't distinguish between "5" and "+5"
-			// So we require explicit sign by checking the original arg
-			foundExplicitSign := false
-			for i, arg := range os.Args {
-				if arg == "-delta" && i+1 < len(os.Args) {
-					val := os.Args[i+1]
-					if len(val) > 0 && (val[0] == '+' || val[0] == '-') {
-						foundExplicitSign = true
-						break
-					}
-				}
-			}
-			if !foundExplicitSign && *heightDelta > 0 {
-				fmt.Fprintf(os.Stderr, "Error: -delta requires explicit sign (use +%d or -%d, not %d)\n", *heightDelta, *heightDelta, *heightDelta)
-				os.Exit(1)
-			}
+	// Determine which mode: absolute height, delta offset, or default delta
+	heightSet := false
+	deltaSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "height" {
+			heightSet = true
 		}
+		if f.Name == "delta" {
+			deltaSet = true
+		}
+	})
+
+	var mode int
+	var modeValue int
+
+	if heightSet {
+		// Absolute mode: use the specified height, ignore delta
+		mode = 0 // absolute
+		modeValue = *height
+	} else if deltaSet {
+		// Delta mode: use the specified delta value
+		mode = 1 // delta
+		modeValue = *heightDelta
+	} else {
+		// Default mode: delta with 2000
+		mode = 1 // delta
+		modeValue = 2000
 	}
 
-	if err := run(args, *height, *heightDelta); err != nil {
-		fmt.Fprintf(os.Stderr, "giant-pty: %v\n", err)
+	if err := run(args, mode, modeValue); err != nil {
+		fmt.Fprintf(os.Stderr, "loooooooong-term: %v\n", err)
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
@@ -470,7 +501,7 @@ func (m *magicDetector) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-func run(args []string, initialHeight, initialDelta int) error {
+func run(args []string, mode, modeValue int) error {
 	// Get the real terminal size
 	realWidth, realHeight, err := term.GetSize(int(os.Stdin.Fd()))
 	if err != nil {
@@ -479,16 +510,28 @@ func run(args []string, initialHeight, initialDelta int) error {
 		realHeight = 24
 	}
 
+	// Save initial mode and value for reset command
+	initialMode := mode
+	initialModeValue := modeValue
+
 	// Height and delta: single source of truth (atomic for lock-free access)
 	var currentHeight atomic.Int32
 	var currentDelta atomic.Int32
-	currentHeight.Store(int32(initialHeight))
-	currentDelta.Store(int32(initialDelta))
+	var modeState atomic.Int32
+	modeState.Store(int32(mode)) // 0 = absolute, 1 = delta
 
-	// Calculate effective height
-	effectiveHeight := initialHeight
-	if initialDelta != 0 {
-		effectiveHeight = realHeight + initialDelta
+	// Initialize based on mode
+	var effectiveHeight int
+	if mode == 0 {
+		// Absolute mode: use the specified height
+		currentHeight.Store(int32(modeValue))
+		currentDelta.Store(0)
+		effectiveHeight = modeValue
+	} else {
+		// Delta mode: use the specified delta
+		currentHeight.Store(int32(realHeight + modeValue))
+		currentDelta.Store(int32(modeValue))
+		effectiveHeight = realHeight + modeValue
 		if effectiveHeight < 1 {
 			effectiveHeight = 1
 		}
@@ -600,10 +643,17 @@ func run(args []string, initialHeight, initialDelta int) error {
 						numericBuf.reset()
 						// Trigger resize
 						sigwinch <- syscall.SIGWINCH
+						// Exit command mode after applying value
+						currentMode.Store(uint32(ModeNormal))
+						// Clear UI
+						w, h, err := term.GetSize(int(os.Stdin.Fd()))
+						if err == nil {
+							ui.clearBox(w, h)
+						}
 					} else {
 						lastError = err.Error()
+						triggerRefresh()
 					}
-					triggerRefresh()
 				case KeyChar:
 					if event.Char >= '0' && event.Char <= '9' {
 						numericBuf.append(event.Char)
@@ -619,7 +669,7 @@ func run(args []string, initialHeight, initialDelta int) error {
 
 			// Normal command mode handling
 			switch event.Code {
-			case KeyESC:
+			case KeyESC, KeyEnter:
 				// Exit command mode
 				currentMode.Store(uint32(ModeNormal))
 				numericBuf.reset()
@@ -647,8 +697,16 @@ func run(args []string, initialHeight, initialDelta int) error {
 					triggerRefresh()
 				case 'r':
 					// Reset to defaults from flags
-					currentHeight.Store(int32(initialHeight))
-					currentDelta.Store(int32(initialDelta))
+					modeState.Store(int32(initialMode))
+					if initialMode == 0 {
+						// Absolute mode
+						currentHeight.Store(int32(initialModeValue))
+						currentDelta.Store(0)
+					} else {
+						// Delta mode
+						currentDelta.Store(int32(initialModeValue))
+						currentHeight.Store(int32(realHeight + initialModeValue))
+					}
 					useRealSize.Store(false)
 					sigwinch <- syscall.SIGWINCH
 					triggerRefresh()

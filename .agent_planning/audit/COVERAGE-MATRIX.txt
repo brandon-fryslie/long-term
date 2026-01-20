@@ -1,0 +1,209 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                  long-term COMMAND-MODE TEST COVERAGE MATRIX               ║
+║                           Audit Date: 2026-01-20                           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+KEY LEGEND:
+  ✓  = Covered by automated tests
+  ⚠  = Partial/manual coverage only
+  ✗  = UNTESTED
+  [n] = Number of test cases needed
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║                        COMPLEXITY SOURCE COVERAGE                           ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+C1: Keyboard Escape Parsing (State Machine)
+  ├─ Basic ASCII input (a-z, 0-9, space)           ✗ [3]
+  ├─ Special keys (backspace, enter, ESC)         ✗ [3]
+  ├─ Arrow keys basic (up, down, left, right)     ✗ [4]
+  ├─ Arrow keys + modifiers (Shift, Ctrl)         ✗ [6]
+  ├─ Escape sequence timeout (100ms window)       ✗ [3]
+  ├─ State machine transitions                     ✗ [4]
+  └─ State recovery from bad sequences            ✗ [3]
+  SUBTOTAL: 26 tests needed ────────────────────────── [26]
+
+C2: Numeric Input Buffer (Validation)
+  ├─ Height mode validation (1-9999)              ✗ [5]
+  ├─ Delta mode validation (±1 to ±9999)         ✗ [6]
+  ├─ Sign requirement for delta                    ✗ [1]
+  ├─ Append/backspace operations                   ✗ [3]
+  └─ Reset and cleanup                             ✗ [1]
+  SUBTOTAL: 18 tests needed ────────────────────────── [18]
+
+C3: ANSI Rendering Engine
+  ├─ Positioning logic (small/normal/large)        ✗ [4]
+  ├─ Mode indicators (real/fake/delta)            ✗ [4]
+  ├─ Numeric input display                         ✗ [2]
+  └─ Box clearing and ANSI codes                   ✗ [2]
+  SUBTOTAL: 12 tests needed ────────────────────────── [12]
+
+C4: Mode State Machine (Atomics)
+  ├─ Atomic reads/writes                           ✗ [4]
+  ├─ Height clamping (1-9999)                      ✗ [3]
+  ├─ Delta bounds (±9999)                          ✗ [2]
+  └─ Toggle state (real/fake)                      ✗ [1]
+  SUBTOTAL: 10 tests needed ────────────────────────── [10]
+
+C5: Magic Detector (Timing)
+  ├─ 3-press detection (Ctrl+\ × 3)               ✗ [1]
+  ├─ Window timeout (500ms expiration)            ✗ [2]
+  ├─ Counter reset logic                           ✗ [3]
+  ├─ Partial presses (<3)                          ✗ [1]
+  └─ Mixed bytes filtering                         ✗ [1]
+  SUBTOTAL: 8 tests needed ────────────────────────── [8]
+
+C6-C10: Other Components (PTY I/O, Signals, Terminal State)
+  ├─ Integration: Mode transitions                 ✗ [3]
+  ├─ Integration: PTY resizing + SIGWINCH         ✗ [4]
+  ├─ Integration: Raw mode cleanup                 ✗ [2]
+  ├─ Integration: /dev/tty fallback               ✗ [1]
+  └─ Integration: Cross-component coordination     ✗ [2]
+  SUBTOTAL: 12 integration tests ─────────────────── [12]
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║                           TEST SUMMARY BY TYPE                              ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+UNIT TESTS (Isolated, No PTY)
+  Keyboard Parser ............................ 26 tests  [0/26] ✗
+  Numeric Buffer ............................. 18 tests  [0/18] ✗
+  ANSI Renderer .............................. 12 tests  [0/12] ✗
+  Mode State Machine ......................... 10 tests  [0/10] ✗
+  Magic Detector ............................. 8 tests  [0/8] ✗
+  ─────────────────────────────────────────────────────────
+  UNIT TOTAL ............................. 74 tests  [0/74] ✗
+
+INTEGRATION TESTS (With PTY/Signals)
+  Command Mode Workflows ..................... 8 tests  [0/8] ✗
+  PTY Resizing & SIGWINCH .................... 4 tests  [0/4] ✗
+  ─────────────────────────────────────────────────────────
+  INTEGRATION TOTAL ....................... 12 tests  [0/12] ✗
+
+GRAND TOTAL ............................... 86 tests  [0/86] ✗
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║                        CRITICAL GAPS BY PRIORITY                            ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+P0 - CRITICAL (Security, Data Loss, Fatal Bugs)
+═══════════════════════════════════════════════════════════════════════════════
+[1] Escape timeout causes frozen input state machine
+[2] Race: Mode toggle × PTY resize can cause size mismatch
+[3] SIGWINCH handler during PTY.Close() can panic
+[4] Raw mode cleanup fails if crash → terminal unusable
+[5] Numeric buffer range validation untested
+[6] Magic detector counter on 4+ presses unclear
+[7] ANSI rendering division by zero if terminal height=0
+[8] /dev/tty fallback behavior undocumented
+
+P0 TOTAL: 8 CRITICAL GAPS
+
+P1 - IMPORTANT (Common User Flows)
+═══════════════════════════════════════════════════════════════════════════════
+[1] Arrow key modifiers (Shift/Ctrl deltas untested)
+[2] Backspace chains in numeric input
+[3] ESC to exit numeric mode
+[4] Delta sign prefix validation
+[5] Height/delta toggle (space key)
+[6] Reset command synchronization
+[7] Keyboard parser state leaks between events
+[8] Numeric input with invalid data
+[9] Terminal resize during command mode
+[10] Multiple escape sequences in one write()
+[11] Mode toggle while entering numeric input
+[12] Unknown arrow keys in dumb terminals
+
+P1 TOTAL: 12 IMPORTANT GAPS
+
+P2 - NICE-TO-HAVE (Edge Cases, Secondary Features)
+═══════════════════════════════════════════════════════════════════════════════
+[1] Printable ASCII range completeness (non-US keyboards)
+[2] Startup hint display with no stderr
+[3] Shell alias fallback handling
+[4] Very large height values clamping
+[5] Error message clarity
+[6] Magic detector rapid presses (10x in 500ms)
+
+P2 TOTAL: 6 OPTIONAL GAPS
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║                    EFFORT & TIMELINE ESTIMATION                             ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+Sprint 1: Keyboard Parsing (2-3 days)
+  ├─ 26 unit tests for escape sequences
+  ├─ Expected bugs found: State leaks, timeout issues
+  └─ LOC: 1,040-1,560
+
+Sprint 2: Input & Rendering (1-2 days)
+  ├─ 30 unit tests (numeric + ANSI)
+  ├─ Expected bugs found: Validation, display edge cases
+  └─ LOC: 900-1,200
+
+Sprint 3: State Machines (1-2 days)
+  ├─ 18 unit tests (mode + magic detector)
+  ├─ Expected bugs found: Race conditions, timing
+  └─ LOC: 450-630
+
+Sprint 4: Integration (2-3 days)
+  ├─ 12 integration tests
+  ├─ Expected bugs found: Cross-component issues
+  └─ LOC: 800-1,200
+
+Sprint 5: CI (1 day)
+  ├─ GitHub Actions configuration
+  ├─ Coverage reporting
+  └─ LOC: 200-300
+
+TOTAL EFFORT: 8-11 days
+TOTAL TEST LOC: ~4,000-5,000 lines
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║                         CURRENT STATE SNAPSHOT                              ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+Codebase Metrics:
+  ├─ Implementation LOC: 795
+  ├─ Test LOC: 0 (automated)
+  ├─ Manual tests: 1 (outdated script)
+  ├─ Goroutines: 5 concurrent
+  ├─ Atomic operations: 4 (untested)
+  ├─ Channels: 4 (untested)
+  ├─ State machines: 3 (untested)
+  └─ Escape sequences: 8+ combinations (untested)
+
+Risk Assessment:
+  ├─ High-risk areas: 4 (keyboard parser, mode sync, signals, raw mode)
+  ├─ Medium-risk areas: 3 (rendering, timing, I/O)
+  ├─ Low-risk areas: 2 (display, fallbacks)
+  └─ Overall risk level: HIGH (0% coverage of complex logic)
+
+Architecture Classification:
+  ├─ Type: CLI Tool + Interactive UI
+  ├─ Pattern: Event-driven state machine
+  ├─ Concurrency: Multi-goroutine with atomics
+  ├─ I/O: PTY wrapper with signal handling
+  └─ Complexity: HIGH (10 significant components)
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║                        RECOMMENDED READING ORDER                            ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+Everyone:
+  1. README.md (this file context)
+  2. AUDIT-SUMMARY.md (10 min overview)
+
+Developers:
+  3. TEST-AUDIT-REPORT.md (40-50 min deep dive)
+  4. TEST-CASE-TEMPLATES.md (implementation guide)
+
+Managers:
+  → AUDIT-SUMMARY.md (effort/timeline)
+  → This file (visual overview)
+
+═══════════════════════════════════════════════════════════════════════════════
+                     All audit documents located at:
+           /Users/bmf/code/long-term/.agent_planning/audit/
+═══════════════════════════════════════════════════════════════════════════════
+
