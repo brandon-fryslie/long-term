@@ -107,6 +107,154 @@ func (nb *NumericBuffer) value() (int, error) {
 	return val, nil
 }
 
+// ANSI escape code constants
+const (
+	ansiReset       = "\033[0m"
+	ansiHideCursor  = "\033[?25l"
+	ansiShowCursor  = "\033[?25h"
+	ansiSaveCursor  = "\033[s"
+	ansiRestoreCursor = "\033[u"
+	ansiClearLine   = "\033[2K"
+)
+
+func ansiMoveCursor(row, col int) string {
+	return fmt.Sprintf("\033[%d;%dH", row, col)
+}
+
+// uiRenderer manages /dev/tty output for command mode UI
+type uiRenderer struct {
+	tty       *os.File
+	available bool
+	boxWidth  int
+}
+
+func newUIRenderer() *uiRenderer {
+	tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+	if err != nil {
+		// /dev/tty unavailable - command mode will be disabled
+		return &uiRenderer{available: false, boxWidth: 40}
+	}
+	return &uiRenderer{
+		tty:       tty,
+		available: true,
+		boxWidth:  40,
+	}
+}
+
+func (ui *uiRenderer) close() {
+	if ui.tty != nil {
+		ui.tty.Close()
+	}
+}
+
+// renderBox draws the command mode UI overlay
+func (ui *uiRenderer) renderBox(termWidth, termHeight, currentHeight, currentDelta int, useReal bool, numBuf NumericBuffer, errorMsg string) {
+	if !ui.available {
+		return
+	}
+
+	// Calculate position: 1/4 from top, right-aligned
+	boxRow := termHeight / 4
+	boxCol := termWidth - ui.boxWidth
+	if boxCol < 1 {
+		boxCol = 1
+	}
+
+	// Build UI content in buffer
+	var buf bytes.Buffer
+
+	// Hide cursor and save position
+	buf.WriteString(ansiHideCursor)
+	buf.WriteString(ansiSaveCursor)
+
+	// Determine mode string
+	modeStr := ""
+	if useReal {
+		modeStr = "(real)"
+	} else if currentDelta != 0 {
+		sign := "+"
+		if currentDelta < 0 {
+			sign = ""
+		}
+		modeStr = fmt.Sprintf("(Δ%s%d)", sign, currentDelta)
+	} else {
+		modeStr = "(fake)"
+	}
+
+	// Box content lines
+	lines := []string{
+		"┌──────────────────────────────────────┐",
+		"│   LONG-TERM ENABLED                  │",
+		"├──────────────────────────────────────┤",
+		fmt.Sprintf("│ Term size: %dx%d %-18s│", termWidth, termHeight, modeStr),
+		"│                                      │",
+	}
+
+	// Show numeric input or error
+	if errorMsg != "" {
+		lines = append(lines, fmt.Sprintf("│ ERROR: %-30s│", errorMsg))
+	} else if numBuf.mode == NumericHeight {
+		input := string(numBuf.digits) + "_"
+		lines = append(lines, fmt.Sprintf("│ Enter height: %-23s│", input))
+	} else if numBuf.mode == NumericDelta {
+		input := string(numBuf.digits) + "_"
+		lines = append(lines, fmt.Sprintf("│ Enter delta: %-24s│", input))
+	} else {
+		// Normal command help
+		lines = append(lines,
+			"│ UP/DOWN: ±1  Shift: ±20  Ctrl: ±200  │",
+			"│ n: set height  d: set delta          │",
+			"│ space: toggle  r: reset  ESC: exit   │",
+		)
+	}
+
+	lines = append(lines, "└──────────────────────────────────────┘")
+
+	// Render each line
+	for i, line := range lines {
+		row := boxRow + i
+		buf.WriteString(ansiMoveCursor(row, boxCol))
+		buf.WriteString(ansiClearLine)
+		buf.WriteString(line)
+	}
+
+	// Restore cursor and show
+	buf.WriteString(ansiRestoreCursor)
+	buf.WriteString(ansiShowCursor)
+
+	// Atomic write
+	ui.tty.Write(buf.Bytes())
+}
+
+// clearBox removes the UI overlay
+func (ui *uiRenderer) clearBox(termWidth, termHeight int) {
+	if !ui.available {
+		return
+	}
+
+	boxRow := termHeight / 4
+	boxCol := termWidth - ui.boxWidth
+	if boxCol < 1 {
+		boxCol = 1
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString(ansiHideCursor)
+	buf.WriteString(ansiSaveCursor)
+
+	// Clear approximately 10 lines where box was
+	for i := 0; i < 10; i++ {
+		row := boxRow + i
+		buf.WriteString(ansiMoveCursor(row, boxCol))
+		buf.WriteString(ansiClearLine)
+	}
+
+	buf.WriteString(ansiRestoreCursor)
+	buf.WriteString(ansiShowCursor)
+
+	ui.tty.Write(buf.Bytes())
+}
+
 // keyboardParser reads stdin and emits KeyEvent structs
 type keyboardParser struct {
 	eventChan  chan KeyEvent
@@ -355,6 +503,15 @@ func run(args []string, initialHeight, initialDelta int) error {
 
 	// Numeric input state
 	var numericBuf NumericBuffer
+	var lastError string
+
+	// Create UI renderer
+	ui := newUIRenderer()
+	defer ui.close()
+
+	if !ui.available {
+		fmt.Fprintf(os.Stderr, "Warning: /dev/tty unavailable, command mode UI disabled\n")
+	}
 
 	// Create keyboard parser
 	kbParser := newKeyboardParser()
@@ -362,12 +519,52 @@ func run(args []string, initialHeight, initialDelta int) error {
 	// Create SIGWINCH channel first (needed by toggle handler)
 	sigwinch := make(chan os.Signal, 1)
 
+	// UI refresh trigger channel
+	refreshUI := make(chan bool, 10)
+
+	// Helper function to trigger UI refresh
+	triggerRefresh := func() {
+		select {
+		case refreshUI <- true:
+		default:
+		}
+	}
+
 	// Channel for entering command mode (Ctrl+\ x3)
 	enterCommandChan := make(chan bool, 1)
 	go func() {
 		for range enterCommandChan {
 			currentMode.Store(uint32(ModeCommand))
-			// TODO: Show UI in Sprint 2
+			triggerRefresh()
+		}
+	}()
+
+	// UI refresh goroutine
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				// Refresh if in command mode
+				if Mode(currentMode.Load()) == ModeCommand {
+					w, h, err := term.GetSize(int(os.Stdin.Fd()))
+					if err == nil {
+						ui.renderBox(w, h, int(currentHeight.Load()), int(currentDelta.Load()),
+							useRealSize.Load(), numericBuf, lastError)
+					}
+				}
+			case <-refreshUI:
+				// Immediate refresh requested
+				if Mode(currentMode.Load()) == ModeCommand {
+					w, h, err := term.GetSize(int(os.Stdin.Fd()))
+					if err == nil {
+						ui.renderBox(w, h, int(currentHeight.Load()), int(currentDelta.Load()),
+							useRealSize.Load(), numericBuf, lastError)
+					}
+				}
+			}
 		}
 	}()
 
@@ -378,15 +575,17 @@ func run(args []string, initialHeight, initialDelta int) error {
 				continue
 			}
 
+			lastError = "" // Clear error on new input
+
 			// Handle numeric input mode
 			if numericBuf.mode != NumericNone {
 				switch event.Code {
 				case KeyESC:
 					numericBuf.reset()
-					// TODO: Update UI
+					triggerRefresh()
 				case KeyBackspace:
 					numericBuf.backspace()
-					// TODO: Update UI
+					triggerRefresh()
 				case KeyEnter:
 					val, err := numericBuf.value()
 					if err == nil {
@@ -400,8 +599,10 @@ func run(args []string, initialHeight, initialDelta int) error {
 						numericBuf.reset()
 						// Trigger resize
 						sigwinch <- syscall.SIGWINCH
+					} else {
+						lastError = err.Error()
 					}
-					// TODO: Show error if invalid
+					triggerRefresh()
 				case KeyChar:
 					if event.Char >= '0' && event.Char <= '9' {
 						numericBuf.append(event.Char)
@@ -410,7 +611,7 @@ func run(args []string, initialHeight, initialDelta int) error {
 							numericBuf.append(event.Char)
 						}
 					}
-					// TODO: Update UI
+					triggerRefresh()
 				}
 				continue
 			}
@@ -421,31 +622,35 @@ func run(args []string, initialHeight, initialDelta int) error {
 				// Exit command mode
 				currentMode.Store(uint32(ModeNormal))
 				numericBuf.reset()
-				// TODO: Clear UI in Sprint 2
+				// Clear UI
+				w, h, err := term.GetSize(int(os.Stdin.Fd()))
+				if err == nil {
+					ui.clearBox(w, h)
+				}
 
 			case KeyChar:
 				switch event.Char {
 				case 'n':
 					numericBuf.mode = NumericHeight
 					numericBuf.digits = nil
-					// TODO: Update UI to show prompt
+					triggerRefresh()
 				case 'd':
 					numericBuf.mode = NumericDelta
 					numericBuf.digits = nil
-					// TODO: Update UI to show prompt
+					triggerRefresh()
 				case ' ':
 					// Toggle real/fake size
 					current := useRealSize.Load()
 					useRealSize.Store(!current)
 					sigwinch <- syscall.SIGWINCH
-					// TODO: Update UI
+					triggerRefresh()
 				case 'r':
 					// Reset to defaults from flags
 					currentHeight.Store(int32(initialHeight))
 					currentDelta.Store(int32(initialDelta))
 					useRealSize.Store(false)
 					sigwinch <- syscall.SIGWINCH
-					// TODO: Update UI
+					triggerRefresh()
 				}
 
 			case KeyUp, KeyDown:
@@ -475,7 +680,7 @@ func run(args []string, initialHeight, initialDelta int) error {
 					currentHeight.Store(int32(newHeight))
 				}
 				sigwinch <- syscall.SIGWINCH
-				// TODO: Update UI
+				triggerRefresh()
 			}
 		}
 	}()
@@ -529,6 +734,11 @@ func run(args []string, initialHeight, initialDelta int) error {
 					Rows: uint16(targetHeight),
 					Cols: uint16(w),
 				})
+
+				// Refresh UI if in command mode (handles resize)
+				if Mode(currentMode.Load()) == ModeCommand {
+					triggerRefresh()
+				}
 			}
 		}
 	}()
