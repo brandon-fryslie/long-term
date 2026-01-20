@@ -109,12 +109,13 @@ func (nb *NumericBuffer) value() (int, error) {
 
 // ANSI escape code constants
 const (
-	ansiReset       = "\033[0m"
-	ansiHideCursor  = "\033[?25l"
-	ansiShowCursor  = "\033[?25h"
-	ansiSaveCursor  = "\033[s"
+	ansiReset         = "\033[0m"
+	ansiHideCursor    = "\033[?25l"
+	ansiShowCursor    = "\033[?25h"
+	ansiSaveCursor    = "\033[s"
 	ansiRestoreCursor = "\033[u"
-	ansiClearLine   = "\033[2K"
+	ansiClearLine     = "\033[2K"
+	ansiGray          = "\033[90m"
 )
 
 func ansiMoveCursor(row, col int) string {
@@ -744,6 +745,11 @@ func run(args []string, initialHeight, initialDelta int) error {
 	}()
 	// Trigger initial resize
 	sigwinch <- syscall.SIGWINCH
+
+	// Display startup hint (before entering raw mode)
+	if term.IsTerminal(int(os.Stderr.Fd())) && ui.available {
+		fmt.Fprintf(os.Stderr, "%slong-term: Press Ctrl+\\ x3 for command mode%s\n", ansiGray, ansiReset)
+	}
 
 	// Put terminal into raw mode (only if stdin is a terminal)
 	var oldState *term.State
